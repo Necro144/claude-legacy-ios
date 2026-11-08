@@ -1,9 +1,13 @@
 import SwiftUI
 import WebKit
+import Combine
 
 final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     let webView: WKWebView
-    @Published var failure: String?
+    @Published var failed = false
+    @Published var progress: Double = 0
+    @Published var loading = false
+    private var bag = Set<AnyCancellable>()
 
     override init() {
         let config = WKWebViewConfiguration()
@@ -14,31 +18,60 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
+        webView.overrideUserInterfaceStyle = .dark
+        webView.isOpaque = false
+        webView.backgroundColor = .black
+        webView.scrollView.backgroundColor = .black
+        webView.scrollView.indicatorStyle = .white
+
+        let refresh = UIRefreshControl()
+        refresh.tintColor = .white
+        refresh.addTarget(self, action: #selector(pulled), for: .valueChanged)
+        webView.scrollView.refreshControl = refresh
+
+        webView.publisher(for: \.estimatedProgress)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.progress = $0 }
+            .store(in: &bag)
         home()
     }
 
+    @objc private func pulled() { reload() }
+
     func home() {
-        failure = nil
+        failed = false
         webView.load(URLRequest(url: URL(string: "https://claude.ai")!))
     }
 
-    // Links that want a new window open in the same view instead.
+    func reload() {
+        failed = false
+        if webView.url == nil { home() } else { webView.reload() }
+    }
+
+    private func done(failure: Bool) {
+        loading = false
+        failed = failure
+        webView.scrollView.refreshControl?.endRefreshing()
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { loading = true }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { done(failure: false) }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        if (error as NSError).code == NSURLErrorCancelled { return }
+        done(failure: true)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        if (error as NSError).code == NSURLErrorCancelled { return }
+        done(failure: true)
+    }
+
+    // Anything that wants a new window opens in the same view.
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
         return nil
-    }
-
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        failure = error.localizedDescription
-    }
-
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        failure = error.localizedDescription
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        failure = nil
     }
 }
 
@@ -52,23 +85,36 @@ struct WebTab: View {
     @StateObject private var model = WebModel()
 
     var body: some View {
-        VStack(spacing: 0) {
+        ZStack(alignment: .top) {
+            Theme.bg.ignoresSafeArea()
             WebContainer(webView: model.webView)
-            if let failure = model.failure {
-                Text(failure).font(.footnote).foregroundColor(.red).padding(6)
+
+            if model.loading && model.progress < 1 {
+                GeometryReader { geo in
+                    Rectangle()
+                        .fill(Theme.accent)
+                        .frame(width: geo.size.width * model.progress, height: 2)
+                }
+                .frame(height: 2)
             }
-            HStack {
-                Button { model.webView.goBack() } label: { Image(systemName: "chevron.left") }
-                Spacer()
-                Button { model.webView.goForward() } label: { Image(systemName: "chevron.right") }
-                Spacer()
-                Button { model.webView.reload() } label: { Image(systemName: "arrow.clockwise") }
-                Spacer()
-                Button { model.home() } label: { Image(systemName: "house") }
+
+            if model.failed {
+                VStack(spacing: 14) {
+                    Image(systemName: "wifi.exclamationmark")
+                        .font(.system(size: 40))
+                        .foregroundColor(Theme.dim)
+                    Text("Can't reach Claude")
+                        .font(.headline)
+                    Text("Check your connection and try again.")
+                        .font(.subheadline)
+                        .foregroundColor(Theme.dim)
+                    Button("Try again") { model.reload() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Theme.accent)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Theme.bg)
             }
-            .padding(.horizontal, 28)
-            .padding(.vertical, 10)
-            .background(Color(UIColor.secondarySystemBackground))
         }
     }
 }

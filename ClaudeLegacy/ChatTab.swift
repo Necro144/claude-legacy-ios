@@ -1,9 +1,17 @@
 import SwiftUI
 
-struct ChatMessage: Identifiable, Equatable {
-    let id = UUID()
+struct ChatMessage: Identifiable, Equatable, Codable {
+    var id = UUID()
     let role: String   // "user" or "assistant"
     var text: String
+}
+
+struct ChatConfig {
+    var key: String
+    var model: String
+    var system: String
+    var temperature: Double
+    var maxTokens: Int
 }
 
 @MainActor
@@ -12,8 +20,21 @@ final class ChatModel: ObservableObject {
     @Published var busy = false
     @Published var error: String?
     private var task: Task<Void, Never>?
+    private let saveKey = "chat.history"
 
-    func send(_ text: String, key: String, model: String, system: String) {
+    init() {
+        if let data = UserDefaults.standard.data(forKey: saveKey),
+           let saved = try? JSONDecoder().decode([ChatMessage].self, from: data) {
+            messages = saved
+        }
+    }
+
+    private func persist() {
+        let keep = messages.filter { !$0.text.isEmpty }
+        if let data = try? JSONEncoder().encode(keep) { UserDefaults.standard.set(data, forKey: saveKey) }
+    }
+
+    func send(_ text: String, config: ChatConfig) {
         messages.append(ChatMessage(role: "user", text: text))
         messages.append(ChatMessage(role: "assistant", text: ""))
         busy = true
@@ -21,7 +42,7 @@ final class ChatModel: ObservableObject {
         let history: [[String: String]] = messages
             .filter { !$0.text.isEmpty }
             .map { ["role": $0.role, "content": $0.text] }
-        task = Task { await self.stream(history: history, key: key, model: model, system: system) }
+        task = Task { await self.stream(history: history, config: config) }
     }
 
     func stop() { task?.cancel() }
@@ -31,22 +52,30 @@ final class ChatModel: ObservableObject {
         messages = []
         error = nil
         busy = false
+        persist()
     }
 
-    private func stream(history: [[String: String]], key: String, model: String, system: String) async {
+    private func stream(history: [[String: String]], config: ChatConfig) async {
         defer {
             busy = false
             if let last = messages.last, last.role == "assistant", last.text.isEmpty { messages.removeLast() }
+            persist()
         }
         do {
             var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
             request.httpMethod = "POST"
             request.timeoutInterval = 120
-            request.setValue(key, forHTTPHeaderField: "x-api-key")
+            request.setValue(config.key, forHTTPHeaderField: "x-api-key")
             request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             request.setValue("application/json", forHTTPHeaderField: "content-type")
-            var body: [String: Any] = ["model": model, "max_tokens": 4096, "stream": true, "messages": history]
-            if !system.isEmpty { body["system"] = system }
+            var body: [String: Any] = [
+                "model": config.model,
+                "max_tokens": config.maxTokens,
+                "temperature": config.temperature,
+                "stream": true,
+                "messages": history
+            ]
+            if !config.system.isEmpty { body["system"] = config.system }
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
             let (bytes, response) = try await URLSession.shared.bytes(for: request)
@@ -87,129 +116,235 @@ final class ChatModel: ObservableObject {
     }
 }
 
-struct ChatTab: View {
-    @StateObject private var chat = ChatModel()
-    @AppStorage("model") private var model = "claude-sonnet-5-5"
-    @AppStorage("system") private var system = ""
-    @State private var apiKey = Keychain.load()
-    @State private var draft = ""
-    @State private var showSettings = false
+// MARK: - Views
+
+struct CodeBlock: View {
+    let language: String
+    let code: String
+    @State private var copied = false
 
     var body: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                if apiKey.isEmpty {
-                    VStack(spacing: 12) {
-                        Text("Add your Anthropic API key to chat here.")
-                        Button("Open settings") { showSettings = true }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    messageList
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(language.isEmpty ? "code" : language)
+                    .font(.caption)
+                    .foregroundColor(Theme.dim)
+                Spacer()
+                Button {
+                    UIPasteboard.general.string = code
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                } label: {
+                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        .font(.caption)
                 }
-                if let error = chat.error {
-                    Text(error).font(.footnote).foregroundColor(.red).padding(.horizontal).padding(.top, 6)
-                }
-                inputBar
+                .foregroundColor(Theme.dim)
             }
-            .navigationTitle("Claude")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button { chat.reset() } label: { Image(systemName: "square.and.pencil") }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            Divider().background(Theme.hairline)
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.system(size: 13, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(12)
+            }
+        }
+        .background(Theme.surface)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.hairline))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct MessageView: View {
+    let message: ChatMessage
+
+    private struct Part: Identifiable {
+        let id: Int
+        let isCode: Bool
+        let language: String
+        let body: String
+    }
+
+    private var parts: [Part] {
+        let pieces = message.text.components(separatedBy: "```")
+        var out: [Part] = []
+        for (i, piece) in pieces.enumerated() {
+            if i % 2 == 1 {
+                var lines = piece.components(separatedBy: "\n")
+                let lang = lines.isEmpty ? "" : lines.removeFirst().trimmingCharacters(in: .whitespaces)
+                out.append(Part(id: i, isCode: true, language: lang,
+                                body: lines.joined(separator: "\n").trimmingCharacters(in: .newlines)))
+            } else {
+                let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { out.append(Part(id: i, isCode: false, language: "", body: trimmed)) }
+            }
+        }
+        return out
+    }
+
+    private func rich(_ s: String) -> AttributedString {
+        (try? AttributedString(markdown: s,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
+    }
+
+    var body: some View {
+        if message.role == "user" {
+            HStack {
+                Spacer(minLength: 56)
+                Text(message.text)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(Theme.surface2)
+                    .clipShape(RoundedRectangle(cornerRadius: 20))
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                if message.text.isEmpty {
+                    ProgressView().tint(Theme.accent)
                 }
+                ForEach(parts) { part in
+                    if part.isCode {
+                        CodeBlock(language: part.language, code: part.body)
+                    } else {
+                        Text(rich(part.body)).textSelection(.enabled).lineSpacing(3)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contextMenu {
+                Button { UIPasteboard.general.string = message.text } label: { Label("Copy reply", systemImage: "doc.on.doc") }
+            }
+        }
+    }
+}
+
+struct ChatTab: View {
+    @EnvironmentObject var store: Store
+    @EnvironmentObject var chat: ChatModel
+    @AppStorage("model") private var model = ClaudeModels.defaultID
+    @AppStorage("system") private var system = ""
+    @AppStorage("temperature") private var temperature = 1.0
+    @AppStorage("maxTokens") private var maxTokens = 4096
+    @State private var draft = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Theme.bg.ignoresSafeArea()
+                VStack(spacing: 0) {
+                    if store.apiKey.isEmpty {
+                        setupPrompt
+                    } else if chat.messages.isEmpty {
+                        emptyState
+                    } else {
+                        messageList
+                    }
+                    if let error = chat.error {
+                        Text(error)
+                            .font(.footnote)
+                            .foregroundColor(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 6)
+                    }
+                    inputBar
+                }
+            }
+            .navigationTitle(ClaudeModels.name(for: model))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.black, for: .navigationBar)
+            .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    Button { chat.reset() } label: { Image(systemName: "square.and.pencil") }
+                        .disabled(chat.messages.isEmpty)
                 }
             }
         }
-        .navigationViewStyle(.stack)
-        .sheet(isPresented: $showSettings) { settingsSheet }
+    }
+
+    private var setupPrompt: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "key.fill").font(.system(size: 34)).foregroundColor(Theme.accent)
+            Text("Add your API key").font(.title3.bold())
+            Text("Chat talks to Claude directly with your own Anthropic API key.")
+                .font(.subheadline).foregroundColor(Theme.dim).multilineTextAlignment(.center)
+            Button("Open Settings") { store.tab = 2 }
+                .buttonStyle(.borderedProminent).tint(Theme.accent)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "sparkle").font(.system(size: 38)).foregroundColor(Theme.accent)
+            Text("How can I help?").font(.title2.bold())
+            Text(ClaudeModels.name(for: model)).font(.subheadline).foregroundColor(Theme.dim)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onTapGesture { focused = false }
     }
 
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
+                LazyVStack(alignment: .leading, spacing: 22) {
                     ForEach(chat.messages) { m in
-                        bubble(m).id(m.id)
+                        MessageView(message: m).id(m.id)
                     }
                 }
-                .padding()
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
             }
+            .scrollDismissesKeyboard(.interactively)
             .onChange(of: chat.messages) { _ in
                 if let last = chat.messages.last { proxy.scrollTo(last.id, anchor: .bottom) }
             }
         }
     }
 
-    private func bubble(_ m: ChatMessage) -> some View {
-        let isUser = m.role == "user"
-        let shown = (try? AttributedString(markdown: m.text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(m.text)
-        return HStack {
-            if isUser { Spacer(minLength: 40) }
-            Text(m.text.isEmpty ? AttributedString("...") : shown)
-                .textSelection(.enabled)
-                .padding(10)
-                .background(isUser ? Color.accentColor.opacity(0.2) : Color(UIColor.secondarySystemBackground))
-                .cornerRadius(14)
-            if !isUser { Spacer(minLength: 40) }
-        }
+    private var canSend: Bool {
+        !store.apiKey.isEmpty && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var inputBar: some View {
-        HStack(spacing: 8) {
-            TextField("Message Claude", text: $draft)
-                .textFieldStyle(.roundedBorder)
-                .disabled(apiKey.isEmpty)
-            if chat.busy {
-                Button { chat.stop() } label: { Image(systemName: "stop.circle.fill").font(.title2) }
-            } else {
-                Button { submit() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
-                    .disabled(apiKey.isEmpty || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        HStack(alignment: .bottom, spacing: 8) {
+            TextField("Message Claude", text: $draft, axis: .vertical)
+                .lineLimit(1...6)
+                .focused($focused)
+                .disabled(store.apiKey.isEmpty)
+                .padding(.leading, 14)
+                .padding(.vertical, 10)
+            Button {
+                if chat.busy { chat.stop() } else { submit() }
+            } label: {
+                Image(systemName: chat.busy ? "stop.fill" : "arrow.up")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: 32, height: 32)
+                    .background(chat.busy || canSend ? Theme.accent : Theme.surface2)
+                    .clipShape(Circle())
             }
+            .disabled(!chat.busy && !canSend)
+            .padding(.trailing, 6)
+            .padding(.bottom, 6)
         }
-        .padding(10)
-        .background(Color(UIColor.systemBackground))
+        .background(Theme.surface)
+        .overlay(RoundedRectangle(cornerRadius: 22).stroke(Theme.hairline))
+        .clipShape(RoundedRectangle(cornerRadius: 22))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Theme.bg)
     }
 
     private func submit() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft = ""
-        chat.send(text, key: apiKey, model: model, system: system)
-    }
-
-    private var settingsSheet: some View {
-        NavigationView {
-            Form {
-                Section(header: Text("Anthropic API key"),
-                        footer: Text("Stored in this phone's Keychain. It is only sent to api.anthropic.com. Get one at console.anthropic.com.")) {
-                    SecureField("sk-ant-...", text: $apiKey)
-                        .textInputAutocapitalization(.never)
-                        .disableAutocorrection(true)
-                }
-                Section(header: Text("Model")) {
-                    TextField("Model id", text: $model)
-                        .textInputAutocapitalization(.never)
-                        .disableAutocorrection(true)
-                }
-                Section(header: Text("System prompt (optional)")) {
-                    TextField("Instructions for every chat", text: $system)
-                }
-            }
-            .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
-                        Keychain.save(apiKey.trimmingCharacters(in: .whitespacesAndNewlines))
-                        apiKey = Keychain.load()
-                        showSettings = false
-                    }
-                }
-            }
-        }
+        chat.send(text, config: ChatConfig(key: store.apiKey, model: model, system: system,
+                                           temperature: temperature, maxTokens: maxTokens))
     }
 }
