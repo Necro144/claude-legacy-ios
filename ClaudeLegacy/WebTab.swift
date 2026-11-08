@@ -14,7 +14,7 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
         config.userContentController.addUserScript(
-            WKUserScript(source: WebShim.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            WKUserScript(source: WebShim.script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
         config.userContentController.add(self, name: "jsError")
@@ -27,6 +27,7 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         webView.backgroundColor = .black
         webView.scrollView.backgroundColor = .black
         webView.scrollView.indicatorStyle = .white
+        if #available(iOS 15.0, *) { webView.underPageBackgroundColor = .black }
 
         let refresh = UIRefreshControl()
         refresh.tintColor = .white
@@ -48,7 +49,7 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
 
     func home() {
         failed = false
-        webView.load(URLRequest(url: URL(string: "https://claude.ai")!))
+        webView.load(URLRequest(url: Provider.webURL))
     }
 
     func reload() {
@@ -63,15 +64,35 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { loading = true }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { done(failure: false) }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        done(failure: false)
+        let address = webView.url?.absoluteString ?? "?"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak webView] in
+            let probe = "document.body ? (document.body.innerText.length + ' characters, ' + document.body.children.length + ' elements') : 'no body'"
+            webView?.evaluateJavaScript(probe) { result, _ in
+                ErrorLog.shared.add("loaded \(address): \(result ?? "unknown")")
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if let http = navigationResponse.response as? HTTPURLResponse, http.statusCode >= 400 {
+            ErrorLog.shared.add("HTTP \(http.statusCode) for \(http.url?.absoluteString ?? "?")")
+        }
+        decisionHandler(.allow)
+    }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         if (error as NSError).code == NSURLErrorCancelled { return }
+        ErrorLog.shared.add("navigation failed: \(error.localizedDescription)")
         done(failure: true)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         if (error as NSError).code == NSURLErrorCancelled { return }
+        ErrorLog.shared.add("page could not load: \(error.localizedDescription)")
         done(failure: true)
     }
 
@@ -111,7 +132,7 @@ struct WebTab: View {
                     Image(systemName: "wifi.exclamationmark")
                         .font(.system(size: 40))
                         .foregroundColor(Theme.dim)
-                    Text("Can't reach Claude")
+                    Text("Can't reach \(Provider.name)")
                         .font(.headline)
                     Text("Check your connection and try again.")
                         .font(.subheadline)
@@ -124,5 +145,6 @@ struct WebTab: View {
                 .background(Theme.bg)
             }
         }
+        .background(Theme.bg.ignoresSafeArea())
     }
 }

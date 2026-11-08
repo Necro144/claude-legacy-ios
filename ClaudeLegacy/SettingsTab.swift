@@ -2,12 +2,13 @@ import SwiftUI
 
 struct SettingsTab: View {
     @EnvironmentObject var store: Store
-    @EnvironmentObject var chat: ChatModel
-    @AppStorage("model") private var model = ClaudeModels.defaultID
+    @EnvironmentObject var chats: ChatStore
+    @ObservedObject private var log = ErrorLog.shared
+    @AppStorage("model") private var model = Provider.defaultModel
     @AppStorage("system") private var system = ""
     @AppStorage("temperature") private var temperature = 1.0
     @AppStorage("maxTokens") private var maxTokens = 4096
-    @ObservedObject private var log = ErrorLog.shared
+    @AppStorage("spoofUA") private var spoofUA = true
     @State private var keyDraft = ""
     @State private var custom = ""
     @State private var confirmClear = false
@@ -18,13 +19,13 @@ struct SettingsTab: View {
         return "\(v) (\(b))"
     }
 
-    private var isCustom: Bool { !ClaudeModels.all.contains(where: { $0.id == model }) }
+    private var isCustom: Bool { !Provider.models.contains(where: { $0.id == model }) }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Claude version") {
-                    ForEach(ClaudeModels.all) { m in
+                Section("\(Provider.name) version") {
+                    ForEach(Provider.models) { m in
                         Button {
                             model = m.id
                             custom = ""
@@ -52,13 +53,15 @@ struct SettingsTab: View {
                 Section("Conversation") {
                     TextField("System prompt (optional)", text: $system, axis: .vertical)
                         .lineLimit(1...5)
-                    VStack(alignment: .leading) {
-                        HStack {
-                            Text("Creativity")
-                            Spacer()
-                            Text(String(format: "%.1f", temperature)).foregroundColor(Theme.dim)
+                    if Provider.supportsTemperature {
+                        VStack(alignment: .leading) {
+                            HStack {
+                                Text("Creativity")
+                                Spacer()
+                                Text(String(format: "%.1f", temperature)).foregroundColor(Theme.dim)
+                            }
+                            Slider(value: $temperature, in: 0...1, step: 0.1).tint(Theme.accent)
                         }
-                        Slider(value: $temperature, in: 0...1, step: 0.1).tint(Theme.accent)
                     }
                     Picker("Longest reply", selection: $maxTokens) {
                         Text("1,024 tokens").tag(1024)
@@ -66,13 +69,13 @@ struct SettingsTab: View {
                         Text("4,096 tokens").tag(4096)
                         Text("8,192 tokens").tag(8192)
                     }
-                    Button("Clear conversation", role: .destructive) { confirmClear = true }
-                        .disabled(chat.messages.isEmpty)
+                    Button("Delete all chats", role: .destructive) { confirmClear = true }
+                        .disabled(chats.conversations.isEmpty)
                 }
                 .listRowBackground(Theme.surface)
 
                 Section {
-                    SecureField(store.apiKey.isEmpty ? "sk-ant-..." : "Key saved", text: $keyDraft)
+                    SecureField(store.apiKey.isEmpty ? Provider.keyPlaceholder : "Key saved", text: $keyDraft)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                     Button("Save key") {
@@ -86,11 +89,12 @@ struct SettingsTab: View {
                 } header: {
                     Text("API key")
                 } footer: {
-                    Text("Used by the Chat tab. Kept in this iPhone's Keychain and sent only to api.anthropic.com. Get one at console.anthropic.com.")
+                    Text("Used by the Chat tab. Kept in this iPhone's Keychain and sent only to \(Provider.apiHost). Get one at \(Provider.keySite).")
                 }
                 .listRowBackground(Theme.surface)
 
                 Section {
+                    Toggle("Compatibility mode", isOn: $spoofUA).tint(Theme.accent)
                     NavigationLink {
                         PageErrorsView()
                     } label: {
@@ -101,9 +105,9 @@ struct SettingsTab: View {
                         }
                     }
                 } header: {
-                    Text("Diagnostics")
+                    Text("\(Provider.name) tab")
                 } footer: {
-                    Text("Problems reported by the Claude tab. Useful if a page shows a black screen.")
+                    Text("Compatibility mode presents the app as a newer Safari so the site stops saying this device is out of date. Close and reopen the app after changing it. Page errors lists problems the page reports.")
                 }
                 .listRowBackground(Theme.surface)
 
@@ -116,7 +120,7 @@ struct SettingsTab: View {
                             .background(Theme.accent)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Claude Legacy").font(.headline)
+                            Text("\(Provider.name) Legacy").font(.headline)
                             Text("Version \(version)").font(.caption).foregroundColor(Theme.dim)
                         }
                     }
@@ -125,7 +129,7 @@ struct SettingsTab: View {
                 } header: {
                     Text("About")
                 } footer: {
-                    Text("An unofficial app. Not affiliated with or endorsed by Anthropic.")
+                    Text("An unofficial app. Not affiliated with or endorsed by the company behind \(Provider.name).")
                 }
                 .listRowBackground(Theme.surface)
             }
@@ -133,8 +137,8 @@ struct SettingsTab: View {
             .background(Theme.bg.ignoresSafeArea())
             .navigationTitle("Settings")
             .toolbarBackground(.black, for: .navigationBar)
-            .confirmationDialog("Clear this conversation?", isPresented: $confirmClear, titleVisibility: .visible) {
-                Button("Clear", role: .destructive) { chat.reset() }
+            .confirmationDialog("Delete every chat?", isPresented: $confirmClear, titleVisibility: .visible) {
+                Button("Delete all", role: .destructive) { chats.clearAll() }
             }
         }
     }

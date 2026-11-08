@@ -1,192 +1,9 @@
 import SwiftUI
 
-struct ChatMessage: Identifiable, Equatable, Codable {
-    var id = UUID()
-    let role: String   // "user" or "assistant"
-    var text: String
-}
-
-struct ChatConfig {
-    var key: String
-    var model: String
-    var system: String
-    var temperature: Double
-    var maxTokens: Int
-}
-
-@MainActor
-final class ChatModel: ObservableObject {
-    @Published var messages: [ChatMessage] = []
-    @Published var busy = false
-    @Published var error: String?
-    private var task: Task<Void, Never>?
-    private let saveKey = "chat.history"
-
-    init() {
-        if let data = UserDefaults.standard.data(forKey: saveKey),
-           let saved = try? JSONDecoder().decode([ChatMessage].self, from: data) {
-            messages = saved
-        }
-    }
-
-    private func persist() {
-        let keep = messages.filter { !$0.text.isEmpty }
-        if let data = try? JSONEncoder().encode(keep) { UserDefaults.standard.set(data, forKey: saveKey) }
-    }
-
-    func send(_ text: String, config: ChatConfig) {
-        messages.append(ChatMessage(role: "user", text: text))
-        messages.append(ChatMessage(role: "assistant", text: ""))
-        busy = true
-        error = nil
-        let history: [[String: String]] = messages
-            .filter { !$0.text.isEmpty }
-            .map { ["role": $0.role, "content": $0.text] }
-        task = Task { await self.stream(history: history, config: config) }
-    }
-
-    func stop() { task?.cancel() }
-
-    func reset() {
-        task?.cancel()
-        messages = []
-        error = nil
-        busy = false
-        persist()
-    }
-
-    private func stream(history: [[String: String]], config: ChatConfig) async {
-        defer {
-            busy = false
-            if let last = messages.last, last.role == "assistant", last.text.isEmpty { messages.removeLast() }
-            persist()
-        }
-        do {
-            var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-            request.httpMethod = "POST"
-            request.timeoutInterval = 120
-            request.setValue(config.key, forHTTPHeaderField: "x-api-key")
-            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-            request.setValue("application/json", forHTTPHeaderField: "content-type")
-            var body: [String: Any] = [
-                "model": config.model,
-                "max_tokens": config.maxTokens,
-                "temperature": config.temperature,
-                "stream": true,
-                "messages": history
-            ]
-            if !config.system.isEmpty { body["system"] = config.system }
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-            let (bytes, response) = try await URLSession.shared.bytes(for: request)
-            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-            if http.statusCode != 200 {
-                var raw = ""
-                for try await line in bytes.lines { raw += line }
-                error = "Error \(http.statusCode): \(Self.apiMessage(raw))"
-                return
-            }
-            for try await line in bytes.lines {
-                guard line.hasPrefix("data:") else { continue }
-                let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                guard let data = payload.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let type = obj["type"] as? String else { continue }
-                if type == "content_block_delta",
-                   let delta = obj["delta"] as? [String: Any],
-                   let piece = delta["text"] as? String,
-                   !messages.isEmpty {
-                    messages[messages.count - 1].text += piece
-                } else if type == "error" {
-                    error = Self.apiMessage(payload)
-                }
-            }
-        } catch {
-            if Task.isCancelled { return }
-            self.error = error.localizedDescription
-        }
-    }
-
-    private static func apiMessage(_ raw: String) -> String {
-        if let data = raw.data(using: .utf8),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let err = obj["error"] as? [String: Any],
-           let message = err["message"] as? String { return message }
-        return raw
-    }
-}
-
-// MARK: - Views
-
-struct CodeBlock: View {
-    let language: String
-    let code: String
-    @State private var copied = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(language.isEmpty ? "code" : language)
-                    .font(.caption)
-                    .foregroundColor(Theme.dim)
-                Spacer()
-                Button {
-                    UIPasteboard.general.string = code
-                    copied = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
-                } label: {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                        .font(.caption)
-                }
-                .foregroundColor(Theme.dim)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            Divider().background(Theme.hairline)
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(code)
-                    .font(.system(size: 13, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(12)
-            }
-        }
-        .background(Theme.surface)
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.hairline))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-    }
-}
-
 struct MessageView: View {
-    let message: ChatMessage
-
-    private struct Part: Identifiable {
-        let id: Int
-        let isCode: Bool
-        let language: String
-        let body: String
-    }
-
-    private var parts: [Part] {
-        let pieces = message.text.components(separatedBy: "```")
-        var out: [Part] = []
-        for (i, piece) in pieces.enumerated() {
-            if i % 2 == 1 {
-                var lines = piece.components(separatedBy: "\n")
-                let lang = lines.isEmpty ? "" : lines.removeFirst().trimmingCharacters(in: .whitespaces)
-                out.append(Part(id: i, isCode: true, language: lang,
-                                body: lines.joined(separator: "\n").trimmingCharacters(in: .newlines)))
-            } else {
-                let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { out.append(Part(id: i, isCode: false, language: "", body: trimmed)) }
-            }
-        }
-        return out
-    }
-
-    private func rich(_ s: String) -> AttributedString {
-        (try? AttributedString(markdown: s,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
-    }
+    let message: Msg
+    let canRegenerate: Bool
+    let onRegenerate: () -> Void
 
     var body: some View {
         if message.role == "user" {
@@ -203,32 +20,98 @@ struct MessageView: View {
             VStack(alignment: .leading, spacing: 10) {
                 if message.text.isEmpty {
                     ProgressView().tint(Theme.accent)
-                }
-                ForEach(parts) { part in
-                    if part.isCode {
-                        CodeBlock(language: part.language, code: part.body)
-                    } else {
-                        Text(rich(part.body)).textSelection(.enabled).lineSpacing(3)
+                } else {
+                    let blocks = parseBlocks(message.text)
+                    ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                        BlockView(block: block)
                     }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contextMenu {
-                Button { UIPasteboard.general.string = message.text } label: { Label("Copy reply", systemImage: "doc.on.doc") }
+                Button { UIPasteboard.general.string = message.text } label: {
+                    Label("Copy reply", systemImage: "doc.on.doc")
+                }
+                if canRegenerate {
+                    Button { onRegenerate() } label: { Label("Regenerate", systemImage: "arrow.clockwise") }
+                }
             }
         }
     }
 }
 
+struct HistoryView: View {
+    @EnvironmentObject var chats: ChatStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if chats.conversations.isEmpty {
+                    Text("No chats yet.")
+                        .foregroundColor(Theme.dim)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List {
+                        ForEach(chats.conversations) { c in
+                            Button {
+                                chats.select(c.id)
+                                dismiss()
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(c.title).lineLimit(1).foregroundColor(.white)
+                                        Text(c.updated.formatted(date: .abbreviated, time: .shortened))
+                                            .font(.caption)
+                                            .foregroundColor(Theme.dim)
+                                    }
+                                    Spacer()
+                                    if c.id == chats.currentID {
+                                        Image(systemName: "checkmark").foregroundColor(Theme.accent)
+                                    }
+                                }
+                            }
+                            .listRowBackground(Theme.surface)
+                        }
+                        .onDelete { offsets in
+                            let ids = offsets.map { chats.conversations[$0].id }
+                            ids.forEach { chats.delete($0) }
+                        }
+                    }
+                    .scrollContentBackground(.hidden)
+                }
+            }
+            .background(Theme.bg.ignoresSafeArea())
+            .navigationTitle("Chats")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.black, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("New chat") { chats.newChat(); dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
 struct ChatTab: View {
     @EnvironmentObject var store: Store
-    @EnvironmentObject var chat: ChatModel
-    @AppStorage("model") private var model = ClaudeModels.defaultID
+    @EnvironmentObject var chats: ChatStore
+    @AppStorage("model") private var model = Provider.defaultModel
     @AppStorage("system") private var system = ""
     @AppStorage("temperature") private var temperature = 1.0
     @AppStorage("maxTokens") private var maxTokens = 4096
     @State private var draft = ""
+    @State private var showHistory = false
     @FocusState private var focused: Bool
+
+    private var config: ChatConfig {
+        ChatConfig(key: store.apiKey, model: model, system: system, temperature: temperature, maxTokens: maxTokens)
+    }
 
     var body: some View {
         NavigationStack {
@@ -237,12 +120,12 @@ struct ChatTab: View {
                 VStack(spacing: 0) {
                     if store.apiKey.isEmpty {
                         setupPrompt
-                    } else if chat.messages.isEmpty {
+                    } else if chats.messages.isEmpty {
                         emptyState
                     } else {
                         messageList
                     }
-                    if let error = chat.error {
+                    if let error = chats.error {
                         Text(error)
                             .font(.footnote)
                             .foregroundColor(.red)
@@ -253,15 +136,19 @@ struct ChatTab: View {
                     inputBar
                 }
             }
-            .navigationTitle(ClaudeModels.name(for: model))
+            .navigationTitle(Models.name(for: model))
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.black, for: .navigationBar)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button { showHistory = true } label: { Image(systemName: "clock.arrow.circlepath") }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { chat.reset() } label: { Image(systemName: "square.and.pencil") }
-                        .disabled(chat.messages.isEmpty)
+                    Button { chats.newChat() } label: { Image(systemName: "square.and.pencil") }
+                        .disabled(chats.messages.isEmpty)
                 }
             }
+            .sheet(isPresented: $showHistory) { HistoryView() }
         }
     }
 
@@ -269,7 +156,7 @@ struct ChatTab: View {
         VStack(spacing: 14) {
             Image(systemName: "key.fill").font(.system(size: 34)).foregroundColor(Theme.accent)
             Text("Add your API key").font(.title3.bold())
-            Text("Chat talks to Claude directly with your own Anthropic API key.")
+            Text("Chat talks to \(Provider.name) directly with your own API key from \(Provider.keySite).")
                 .font(.subheadline).foregroundColor(Theme.dim).multilineTextAlignment(.center)
             Button("Open Settings") { store.tab = 2 }
                 .buttonStyle(.borderedProminent).tint(Theme.accent)
@@ -282,9 +169,10 @@ struct ChatTab: View {
         VStack(spacing: 10) {
             Image(systemName: "sparkle").font(.system(size: 38)).foregroundColor(Theme.accent)
             Text("How can I help?").font(.title2.bold())
-            Text(ClaudeModels.name(for: model)).font(.subheadline).foregroundColor(Theme.dim)
+            Text(Models.name(for: model)).font(.subheadline).foregroundColor(Theme.dim)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
         .onTapGesture { focused = false }
     }
 
@@ -292,16 +180,25 @@ struct ChatTab: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 22) {
-                    ForEach(chat.messages) { m in
-                        MessageView(message: m).id(m.id)
+                    ForEach(chats.messages) { m in
+                        MessageView(
+                            message: m,
+                            canRegenerate: !chats.busy && m.id == chats.messages.last?.id && m.role == "assistant",
+                            onRegenerate: { chats.regenerate(config: config) }
+                        )
+                        .id(m.id)
                     }
+                    Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 14)
             }
             .scrollDismissesKeyboard(.interactively)
-            .onChange(of: chat.messages) { _ in
-                if let last = chat.messages.last { proxy.scrollTo(last.id, anchor: .bottom) }
+            .onChange(of: chats.messages) { _ in
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+            .onChange(of: chats.currentID) { _ in
+                proxy.scrollTo("bottom", anchor: .bottom)
             }
         }
     }
@@ -312,23 +209,23 @@ struct ChatTab: View {
 
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextField("Message Claude", text: $draft, axis: .vertical)
+            TextField("Message \(Provider.name)", text: $draft, axis: .vertical)
                 .lineLimit(1...6)
                 .focused($focused)
                 .disabled(store.apiKey.isEmpty)
                 .padding(.leading, 14)
                 .padding(.vertical, 10)
             Button {
-                if chat.busy { chat.stop() } else { submit() }
+                if chats.busy { chats.stop() } else { submit() }
             } label: {
-                Image(systemName: chat.busy ? "stop.fill" : "arrow.up")
+                Image(systemName: chats.busy ? "stop.fill" : "arrow.up")
                     .font(.system(size: 15, weight: .bold))
                     .foregroundColor(.white)
                     .frame(width: 32, height: 32)
-                    .background(chat.busy || canSend ? Theme.accent : Theme.surface2)
+                    .background(chats.busy || canSend ? Theme.accent : Theme.surface2)
                     .clipShape(Circle())
             }
-            .disabled(!chat.busy && !canSend)
+            .disabled(!chats.busy && !canSend)
             .padding(.trailing, 6)
             .padding(.bottom, 6)
         }
@@ -344,7 +241,7 @@ struct ChatTab: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft = ""
-        chat.send(text, config: ChatConfig(key: store.apiKey, model: model, system: system,
-                                           temperature: temperature, maxTokens: maxTokens))
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        chats.send(text, config: config)
     }
 }
