@@ -21,29 +21,46 @@ jobs:
       - name: Generate the Xcode project
         run: xcodegen generate
 
-      - name: Build (unsigned)
+      - name: Build the main app (unsigned)
         run: |
           xcodebuild -project ClaudeLegacy.xcodeproj -scheme ClaudeLegacy \
             -configuration Release -sdk iphoneos -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build | tail -n 60
 
-      - name: Package the IPA
+      - name: Build the second copy (own bundle id, own login and data)
+        run: |
+          xcodebuild -project ClaudeLegacy.xcodeproj -scheme ClaudeLegacy \
+            -configuration Release -sdk iphoneos -derivedDataPath build2 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            PRODUCT_BUNDLE_IDENTIFIER=com.necro144.claudelegacy2 \
+            INFOPLIST_KEY_CFBundleDisplayName="Claude 2" \
+            ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon2 \
+            build | tail -n 60
+
+      - name: Package both IPAs
         run: |
           mkdir Payload
           cp -R build/Build/Products/Release-iphoneos/ClaudeLegacy.app Payload/
           zip -qr ClaudeLegacy.ipa Payload
-          ls -l ClaudeLegacy.ipa
+          mkdir -p second/Payload
+          cp -R build2/Build/Products/Release-iphoneos/ClaudeLegacy.app second/Payload/
+          (cd second && zip -qr ../ClaudeLegacy-2.ipa Payload)
+          ls -l *.ipa
 
       - uses: actions/upload-artifact@v4
         with:
           name: ClaudeLegacy-ipa
-          path: ClaudeLegacy.ipa
+          path: |
+            ClaudeLegacy.ipa
+            ClaudeLegacy-2.ipa
 
       - name: Attach to the release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ClaudeLegacy.ipa
+          files: |
+            ClaudeLegacy.ipa
+            ClaudeLegacy-2.ipa
           body_path: release-notes/${{ github.ref_name }}.md
           name: Claude Legacy ${{ github.ref_name }}

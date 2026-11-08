@@ -8,6 +8,10 @@ Three tabs:
 - **Chat**: a native chat screen that talks to the Anthropic API with your own key. Replies stream in, code blocks have a copy button, and the conversation is kept on the phone. API use is billed separately from a Claude subscription.
 - **Settings**: pick the Claude version (Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, or any other model id), system prompt, creativity, reply length, API key (kept in the Keychain, sent only to api.anthropic.com), and an About section.
 
+## Two accounts
+
+Each release has two IPAs: `ClaudeLegacy.ipa` and `ClaudeLegacy-2.ipa`. The second installs as a separate app (its own bundle id and icon), so it keeps its own login, chats and API key. Install both to use two accounts.
+
 ## Releases
 
 Each release on the Releases page has its own "What's new" and the IPA. To publish one, add `release-notes/vX.Y.Z.md`, commit, then push the tag `vX.Y.Z`.
