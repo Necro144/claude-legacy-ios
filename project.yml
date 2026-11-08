@@ -13,8 +13,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.necro144.claudelegacy
         PRODUCT_NAME: ClaudeLegacy
-        MARKETING_VERSION: "1.1.0"
-        CURRENT_PROJECT_VERSION: "2"
+        MARKETING_VERSION: "1.1.1"
+        CURRENT_PROJECT_VERSION: "3"
         SWIFT_VERSION: "5.0"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Claude

@@ -7,6 +7,7 @@ struct SettingsTab: View {
     @AppStorage("system") private var system = ""
     @AppStorage("temperature") private var temperature = 1.0
     @AppStorage("maxTokens") private var maxTokens = 4096
+    @ObservedObject private var log = ErrorLog.shared
     @State private var keyDraft = ""
     @State private var custom = ""
     @State private var confirmClear = false
@@ -90,6 +91,23 @@ struct SettingsTab: View {
                 .listRowBackground(Theme.surface)
 
                 Section {
+                    NavigationLink {
+                        PageErrorsView()
+                    } label: {
+                        HStack {
+                            Text("Page errors")
+                            Spacer()
+                            Text("\(log.items.count)").foregroundColor(Theme.dim)
+                        }
+                    }
+                } header: {
+                    Text("Diagnostics")
+                } footer: {
+                    Text("Problems reported by the Claude tab. Useful if a page shows a black screen.")
+                }
+                .listRowBackground(Theme.surface)
+
+                Section {
                     HStack {
                         Image(systemName: "sparkle")
                             .font(.title2)
@@ -117,6 +135,46 @@ struct SettingsTab: View {
             .toolbarBackground(.black, for: .navigationBar)
             .confirmationDialog("Clear this conversation?", isPresented: $confirmClear, titleVisibility: .visible) {
                 Button("Clear", role: .destructive) { chat.reset() }
+            }
+        }
+    }
+}
+
+struct PageErrorsView: View {
+    @ObservedObject private var log = ErrorLog.shared
+
+    var body: some View {
+        Group {
+            if log.items.isEmpty {
+                Text("No errors so far.")
+                    .foregroundColor(Theme.dim)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(Array(log.items.enumerated()), id: \.offset) { _, item in
+                        Text(item)
+                            .font(.system(size: 12, design: .monospaced))
+                            .textSelection(.enabled)
+                            .listRowBackground(Theme.surface)
+                    }
+                }
+                .scrollContentBackground(.hidden)
+            }
+        }
+        .background(Theme.bg.ignoresSafeArea())
+        .navigationTitle("Page errors")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Menu {
+                    Button { UIPasteboard.general.string = log.items.joined(separator: "\n\n") } label: {
+                        Label("Copy all", systemImage: "doc.on.doc")
+                    }
+                    Button(role: .destructive) { log.clear() } label: {
+                        Label("Clear", systemImage: "trash")
+                    }
+                } label: { Image(systemName: "ellipsis.circle") }
+                .disabled(log.items.isEmpty)
             }
         }
     }

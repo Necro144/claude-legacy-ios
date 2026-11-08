@@ -2,7 +2,7 @@ import SwiftUI
 import WebKit
 import Combine
 
-final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
+final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     let webView: WKWebView
     @Published var failed = false
     @Published var progress: Double = 0
@@ -13,8 +13,12 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
+        config.userContentController.addUserScript(
+            WKUserScript(source: WebShim.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
+        config.userContentController.add(self, name: "jsError")
+        webView.customUserAgent = WebShim.userAgent
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
@@ -34,6 +38,10 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             .sink { [weak self] in self?.progress = $0 }
             .store(in: &bag)
         home()
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if let text = message.body as? String { ErrorLog.shared.add(text) }
     }
 
     @objc private func pulled() { reload() }
