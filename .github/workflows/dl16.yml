@@ -1,0 +1,62 @@
+name: Download test on iOS 16.4
+
+on:
+  push:
+    branches: [dl-test]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build for the simulator
+        run: |
+          set -o pipefail
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild -project ClaudeLegacy.xcodeproj -scheme ClaudeLegacy \
+            -configuration Release -sdk iphonesimulator -derivedDataPath simbuild \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build | tail -n 20
+
+      - name: Install an iOS 16.4 simulator runtime
+        run: |
+          xcodebuild -downloadPlatform iOS -buildVersion 16.4 2>&1 | tail -n 5 || echo "download failed"
+          xcrun simctl list runtimes
+
+      - name: Boot the iOS 16.4 simulator and install the app
+        run: |
+          RT=$(xcrun simctl list runtimes | grep -m1 "iOS 16.4" | grep -oE 'com\.apple\.CoreSimulator\.SimRuntime\.iOS-[0-9-]+' | head -1)
+          UDID=$(xcrun simctl create "iPhone 14 test" com.apple.CoreSimulator.SimDeviceType.iPhone-14 "$RT")
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b | tail -n 3
+          xcrun simctl install "$UDID" simbuild/Build/Products/Release-iphonesimulator/ClaudeLegacy.app
+          mkdir -p shots out
+          cd test && nohup python3 -m http.server 8765 --bind 127.0.0.1 > ../server.log 2>&1 &
+          sleep 2
+
+      - name: Run the download scenarios
+        run: |
+          xcrun simctl terminate "$UDID" com.necro144.claudelegacy || true
+          SIMCTL_CHILD_TEST_URL=http://127.0.0.1:8765/dl.html SIMCTL_CHILD_TEST_WAIT=40 \
+          SIMCTL_CHILD_TEST_JS_FILE="$GITHUB_WORKSPACE/test/noop.js" SIMCTL_CHILD_TEST_JS2_FILE="$GITHUB_WORKSPACE/test/report-site.js" \
+          SIMCTL_CHILD_TEST_OUT="$GITHUB_WORKSPACE/out/dl.txt" xcrun simctl launch "$UDID" com.necro144.claudelegacy
+          sleep 6;  xcrun simctl io "$UDID" screenshot shots/1-after-case-A.png
+          sleep 4;  xcrun simctl io "$UDID" screenshot shots/2-before-case-B.png
+          sleep 10; xcrun simctl io "$UDID" screenshot shots/3-after-case-B.png
+          sleep 12; xcrun simctl io "$UDID" screenshot shots/4-before-case-C.png
+          sleep 8;  xcrun simctl io "$UDID" screenshot shots/5-after-case-C.png
+          sleep 14; xcrun simctl io "$UDID" screenshot shots/6-end.png
+          echo "===== dl"; cat out/dl.txt || echo none
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dl-results
+          path: |
+            shots
+            out

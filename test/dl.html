@@ -1,0 +1,48 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#111;color:#fff;font:20px -apple-system,sans-serif;padding:30px 20px">
+<h2>Download test</h2>
+<pre id="o"></pre>
+<script>
+function log(s) { document.getElementById('o').textContent += s + '\n'; }
+
+// Case A: the way Suno does it. Build a file in memory, click a hidden download link, throw the file away at once.
+function caseA() {
+  var bytes = new Uint8Array(2500000);
+  for (var i = 0; i < bytes.length; i++) bytes[i] = i % 251;
+  var blob = new Blob([bytes], { type: 'audio/mpeg' });
+  var link = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.target = '_blank';
+  a.href = link;
+  a.download = 'test-song.mp3';
+  a.click();
+  URL.revokeObjectURL(link);
+  log('A: blob link clicked and revoked');
+}
+
+// Case B: a normal link to a file on the same site, with a download attribute.
+function caseB() {
+  var a = document.createElement('a');
+  a.href = '/song.mp3';
+  a.download = 'same-site.mp3';
+  document.body.appendChild(a);
+  a.click();
+  log('B: same-site link clicked');
+}
+
+// Case C: a link to a file on ANOTHER site (localhost is a different site from 127.0.0.1), which ignores the download hint.
+function caseC() {
+  var a = document.createElement('a');
+  a.href = 'http://localhost:8765/song.mp3';
+  a.download = 'other-site.mp3';
+  document.body.appendChild(a);
+  a.click();
+  log('C: other-site link clicked');
+}
+
+setTimeout(caseA, 1500);
+setTimeout(caseB, 12000);
+setTimeout(caseC, 24000);
+</script>

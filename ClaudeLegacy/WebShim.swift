@@ -123,6 +123,43 @@ enum WebShim {
 
 
 
+          // Downloads of files the page builds in memory (blob: links). The page clicks a hidden download link and then
+          // immediately discards the file, which the iPhone's own download system is too slow to catch. So take the file
+          // right away, send it to the app in pieces, and let the app save it and open the share sheet.
+          try {
+            var realAnchorClick = HTMLAnchorElement.prototype.click;
+            var sendCount = 0;
+            var sendBlob = function (blob, name) {
+              var id = String(Date.now()) + '-' + (sendCount++);
+              var reader = new FileReader();
+              reader.onload = function () {
+                var text = String(reader.result), base64 = text.slice(text.indexOf(',') + 1);
+                var piece = 1000000 - (1000000 % 4), total = Math.max(1, Math.ceil(base64.length / piece));
+                for (var i = 0; i < total; i++) {
+                  window.webkit.messageHandlers.saveFile.postMessage({ id: id, name: name, index: i, total: total, data: base64.slice(i * piece, (i + 1) * piece) });
+                }
+              };
+              reader.onerror = function () { post('download read failed'); };
+              reader.readAsDataURL(blob);
+            };
+            var takeBlobLink = function (a) {
+              if (!a || !a.href || !/^blob:/.test(a.href) || !a.hasAttribute('download')) return false;
+              var name = a.getAttribute('download') || 'download';
+              post('download from blob: ' + name);
+              fetch(a.href).then(function (r) { return r.blob(); }).then(function (b) { sendBlob(b, name); })
+                .catch(function (e) { post('download failed: ' + e); });
+              return true;
+            };
+            HTMLAnchorElement.prototype.click = function () {
+              if (takeBlobLink(this)) return;
+              return realAnchorClick.apply(this, arguments);
+            };
+            document.addEventListener('click', function (e) {
+              var a = e.target && e.target.closest ? e.target.closest('a') : null;
+              if (a && takeBlobLink(a)) { e.preventDefault(); e.stopImmediatePropagation(); }
+            }, true);
+          } catch (e) { post('download hook: ' + e); }
+
           // Tell the page it is running as an installed app, so it skips "open the app" and "add to home screen" prompts.
           try {
             Object.defineProperty(navigator, 'standalone', { get: function () { return true; }, configurable: true });

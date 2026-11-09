@@ -45,6 +45,7 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
         config.userContentController.add(self, name: "jsError")
+        config.userContentController.add(self, name: "saveFile")
         style(webView)
         webView.allowsBackForwardNavigationGestures = true
         webView.scrollView.indicatorStyle = .white
@@ -77,7 +78,48 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     private func isMain(_ view: WKWebView) -> Bool { view === webView }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "saveFile", let body = message.body as? [String: Any] { receiveFile(body); return }
         if let text = message.body as? String { ErrorLog.shared.add(text) }
+    }
+
+    // MARK: files the page builds in memory (blob links), saved here and handed to the share sheet
+
+    private var incoming: [String: (url: URL, handle: FileHandle)] = [:]
+
+    private func receiveFile(_ body: [String: Any]) {
+        guard let id = body["id"] as? String, let index = body["index"] as? Int, let total = body["total"] as? Int,
+              let text = body["data"] as? String, let bytes = Data(base64Encoded: text) else { return }
+        if index == 0 {
+            var name = (body["name"] as? String ?? "download").replacingOccurrences(of: "/", with: "-")
+            if name.isEmpty { name = "download" }
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let file = folder.appendingPathComponent(name)
+            FileManager.default.createFile(atPath: file.path, contents: nil)
+            guard let handle = try? FileHandle(forWritingTo: file) else { return }
+            incoming[id] = (file, handle)
+            ErrorLog.shared.add("saving \(name)")
+        }
+        guard let entry = incoming[id] else { return }
+        entry.handle.write(bytes)
+        if index == total - 1 {
+            try? entry.handle.close()
+            incoming[id] = nil
+            let size = (try? FileManager.default.attributesOfItem(atPath: entry.url.path)[.size] as? Int) ?? 0
+            ErrorLog.shared.add("saved \(entry.url.lastPathComponent), \(size) bytes")
+            share(entry.url)
+        }
+    }
+
+    private func share(_ file: URL) {
+        DispatchQueue.main.async {
+            let sheet = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+            if let top = topViewController() {
+                sheet.popoverPresentationController?.sourceView = top.view
+                sheet.popoverPresentationController?.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.maxY - 40, width: 1, height: 1)
+                top.present(sheet, animated: true)
+            }
+        }
     }
 
     @objc private func pulled() { reload() }
@@ -186,6 +228,7 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if navigationAction.shouldPerformDownload {
+            ErrorLog.shared.add("download requested: \(navigationAction.request.url?.absoluteString.prefix(80) ?? "?")")
             decisionHandler(.download)
             return
         }
@@ -209,6 +252,13 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
                 decisionHandler(.download)
                 return
             }
+        }
+        // Opening an audio or zip file as the whole page (a link to a file) means "download it", not "show it here".
+        let kind = navigationResponse.response.mimeType?.lowercased() ?? ""
+        if navigationResponse.isForMainFrame && (kind.hasPrefix("audio/") || kind == "application/zip") {
+            ErrorLog.shared.add("file opened as a page, downloading instead: \(kind)")
+            decisionHandler(.download)
+            return
         }
         decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
     }
@@ -306,19 +356,14 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let file = folder.appendingPathComponent(suggestedFilename)
         downloadFiles[ObjectIdentifier(download)] = file
+        ErrorLog.shared.add("download started: \(suggestedFilename)")
         completionHandler(file)
     }
 
     func downloadDidFinish(_ download: WKDownload) {
         guard let file = downloadFiles.removeValue(forKey: ObjectIdentifier(download)) else { return }
-        DispatchQueue.main.async {
-            let sheet = UIActivityViewController(activityItems: [file], applicationActivities: nil)
-            if let top = topViewController() {
-                sheet.popoverPresentationController?.sourceView = top.view
-                sheet.popoverPresentationController?.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.maxY - 40, width: 1, height: 1)
-                top.present(sheet, animated: true)
-            }
-        }
+        ErrorLog.shared.add("downloaded \(file.lastPathComponent)")
+        share(file)
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
