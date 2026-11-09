@@ -25,6 +25,7 @@ enum Chunk {
 
 enum Provider {
     static let name = "Claude"
+    static let host = "claude.ai"
     static let webURL = URL(string: "https://claude.ai")!
     static let keyPlaceholder = "sk-ant-..."
     static let keySite = "console.anthropic.com"

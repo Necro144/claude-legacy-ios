@@ -17,7 +17,9 @@ enum WebShim {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "`", with: "\\`")
             .replacingOccurrences(of: "\n", with: " ")
-        return #"""
+        // TEST_NOHIDE is only used by the automated simulator test.
+        let noHide = ProcessInfo.processInfo.environment["TEST_NOHIDE"] != nil ? "window.__noHide = true;" : ""
+        return noHide + #"""
         (function () {
           function post(msg) {
             try { window.webkit.messageHandlers.jsError.postMessage(String(msg)); } catch (e) {}
@@ -73,11 +75,71 @@ enum WebShim {
             if (!sp.isSubsetOf) sp.isSubsetOf = function (o) { return Array.from(this).every(function (v) { return o.has(v); }); };
             if (!sp.isSupersetOf) sp.isSupersetOf = function (o) { var s = this; return keys(o).every(function (v) { return s.has(v); }); };
             if (!sp.isDisjointFrom) sp.isDisjointFrom = function (o) { return !Array.from(this).some(function (v) { return o.has(v); }); };
+
+            if (!Promise.try) {
+              Promise.try = function (fn) {
+                var args = Array.prototype.slice.call(arguments, 1);
+                return new Promise(function (resolve) { resolve(fn.apply(null, args)); });
+              };
+            }
+            if (window.ReadableStream && !ReadableStream.prototype[Symbol.asyncIterator]) {
+              ReadableStream.prototype[Symbol.asyncIterator] = function () {
+                var reader = this.getReader();
+                return {
+                  next: function () { return reader.read(); },
+                  return: function () { reader.releaseLock(); return Promise.resolve({ done: true, value: undefined }); },
+                  [Symbol.asyncIterator]: function () { return this; }
+                };
+              };
+              ReadableStream.prototype.values = ReadableStream.prototype[Symbol.asyncIterator];
+            }
+            if (window.Element && !Element.prototype.checkVisibility) {
+              Element.prototype.checkVisibility = function () { return !!(this.offsetWidth || this.offsetHeight || this.getClientRects().length); };
+            }
+            if (typeof Iterator === 'undefined') {
+              var IterProto = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+              var IteratorShim = function Iterator() {};
+              IteratorShim.prototype = IterProto;
+              IteratorShim.from = function (o) { return o[Symbol.iterator] ? o[Symbol.iterator]() : o; };
+              window.Iterator = IteratorShim;
+              var wrap = function (it) { return { [Symbol.iterator]: function () { return it; } }; };
+              IterProto.map = function (fn) { var s = this; return (function* () { var i = 0; for (var x of wrap(s)) yield fn(x, i++); })(); };
+              IterProto.filter = function (fn) { var s = this; return (function* () { var i = 0; for (var x of wrap(s)) if (fn(x, i++)) yield x; })(); };
+              IterProto.take = function (n) { var s = this; return (function* () { var i = 0; if (n <= 0) return; for (var x of wrap(s)) { yield x; if (++i >= n) return; } })(); };
+              IterProto.drop = function (n) { var s = this; return (function* () { var i = 0; for (var x of wrap(s)) if (i++ >= n) yield x; })(); };
+              IterProto.flatMap = function (fn) { var s = this; return (function* () { var i = 0; for (var x of wrap(s)) yield* wrap(fn(x, i++)[Symbol.iterator]()); })(); };
+              IterProto.toArray = function () { return Array.from(wrap(this)); };
+              IterProto.forEach = function (fn) { var i = 0; for (var x of wrap(this)) fn(x, i++); };
+              IterProto.some = function (fn) { var i = 0; for (var x of wrap(this)) if (fn(x, i++)) return true; return false; };
+              IterProto.every = function (fn) { var i = 0; for (var x of wrap(this)) if (!fn(x, i++)) return false; return true; };
+              IterProto.find = function (fn) { var i = 0; for (var x of wrap(this)) if (fn(x, i++)) return x; return undefined; };
+              IterProto.reduce = function (fn, init) { var acc = init, first = arguments.length < 2, i = 0; for (var x of wrap(this)) { if (first) { acc = x; first = false; } else acc = fn(acc, x, i); i++; } return acc; };
+            }
             if (!window.requestIdleCallback) {
               window.requestIdleCallback = function (cb) { return setTimeout(function () { cb({ didTimeout: false, timeRemaining: function () { return 10; } }); }, 1); };
               window.cancelIdleCallback = function (id) { clearTimeout(id); };
             }
           } catch (e) { post('shim: ' + e); }
+
+
+
+          // Tell the page it is running as an installed app, so it skips "open the app" and "add to home screen" prompts.
+          try {
+            Object.defineProperty(navigator, 'standalone', { get: function () { return true; }, configurable: true });
+            var realMatchMedia = window.matchMedia.bind(window);
+            window.matchMedia = function (q) {
+              var text = String(q);
+              var standalone = /display-mode:\s*(standalone|minimal-ui)/i.test(text);
+              var browser = /display-mode:\s*browser/i.test(text);
+              if (!standalone && !browser) return realMatchMedia(q);
+              return {
+                matches: standalone, media: text, onchange: null,
+                addListener: function () {}, removeListener: function () {},
+                addEventListener: function () {}, removeEventListener: function () {},
+                dispatchEvent: function () { return false; }
+              };
+            };
+          } catch (e) { post('standalone: ' + e); }
 
           try {
             var style = document.createElement('style');
@@ -85,23 +147,59 @@ enum WebShim {
             (document.head || document.documentElement).appendChild(style);
           } catch (e) { post('css: ' + e); }
 
-          function hideOutdated() {
+          // Removes "out of date" notices and "get the app" prompts, so the page behaves like it is already inside the app.
+          var outdated = /software is out of date|browser is out of date|update your browser|unsupported browser/i;
+          var appPrompt = /$^/;
+          var appButton = /$^/;
+          function unlock() {
+            [document.body, document.documentElement].forEach(function (el) {
+              if (!el) return;
+              el.style.removeProperty('pointer-events');
+              el.style.removeProperty('overflow');
+              el.removeAttribute('data-scroll-locked');
+            });
+          }
+          function hideOverlays() {
             try {
-              if (!document.body) return;
-              var re = /software is out of date|browser is out of date|update your browser|unsupported browser/i;
+              if (window.__noHide || !document.body) return;
               var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-              var n;
+              var n, hidAny = false;
               while ((n = w.nextNode())) {
-                if (re.test(n.nodeValue || '')) {
-                  var el = n.parentElement, hops = 0;
-                  while (el && el.parentElement && hops < 4 && el.parentElement !== document.body &&
+                var t = n.nodeValue || '';
+                if (!t || t.length > 400) continue;
+                var el = n.parentElement;
+                if (!el) continue;
+                if (outdated.test(t)) {
+                  var hops = 0;
+                  while (el.parentElement && hops < 4 && el.parentElement !== document.body &&
                          (el.parentElement.textContent || '').length < 500) { el = el.parentElement; hops++; }
-                  if (el) el.style.display = 'none';
+                  el.style.display = 'none';
+                } else if (appPrompt.test(t)) {
+                  // climb to the pop-up's outermost wrapper (a direct child of <body>) and remove it with its backdrop
+                  var start = el;
+                  while (el.parentElement && el.parentElement !== document.body) el = el.parentElement;
+                  if (el && el !== document.body && (el.textContent || '').length < 800) { el.style.display = 'none'; hidAny = true; }
+                  else {
+                    // a banner inside the page: hide the nearest fixed or sticky box around the text
+                    var box = start, climbed = 0;
+                    while (box && box !== document.body && climbed < 8) {
+                      var pos = getComputedStyle(box).position;
+                      if (pos === 'fixed' || pos === 'sticky') { box.style.display = 'none'; hidAny = true; break; }
+                      box = box.parentElement; climbed++;
+                    }
+                  }
+                } else if (appButton.test(t)) {
+                  var b = el.closest('button, a, [role="button"]') || el;
+                  b.style.display = 'none';
                 }
               }
+              if (hidAny) unlock();
             } catch (e) {}
           }
-          setInterval(hideOutdated, 1500);
+          var hideTimer = null;
+          function scheduleHide() { if (hideTimer) return; hideTimer = setTimeout(function () { hideTimer = null; hideOverlays(); }, 250); }
+          try { new MutationObserver(scheduleHide).observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+          setInterval(hideOverlays, 1500);
 
           var oldError = console.error;
           console.error = function () {

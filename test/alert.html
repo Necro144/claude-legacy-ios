@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#111;color:#fff;font:22px -apple-system,sans-serif;padding:40px 24px">
+<h1>Alert test</h1>
+<p>Newer features: <span id="f"></span></p>
+<script>
+var f = [];
+f.push('withResolvers=' + (typeof Promise.withResolvers));
+f.push('groupBy=' + (typeof Object.groupBy));
+f.push('Iterator=' + (typeof Iterator));
+f.push('setUnion=' + (typeof Set.prototype.union));
+document.getElementById('f').textContent = f.join(' ');
+setTimeout(function () { alert('Hello from the page'); }, 1500);
+</script>

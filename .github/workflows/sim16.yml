@@ -1,0 +1,72 @@
+name: Simulator test on iOS 16.4
+
+on:
+  push:
+    branches: [port-test]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build for the simulator
+        run: |
+          set -o pipefail
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild -project ClaudeLegacy.xcodeproj -scheme ClaudeLegacy \
+            -configuration Release -sdk iphonesimulator -derivedDataPath simbuild \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build | tail -n 20
+
+      - name: Install an iOS 16.4 simulator runtime
+        run: |
+          xcodebuild -downloadPlatform iOS -buildVersion 16.4 2>&1 | tail -n 5 || echo "download failed"
+          xcrun simctl list runtimes
+
+      - name: Boot the iOS 16.4 simulator and install the app
+        run: |
+          RT=$(xcrun simctl list runtimes | grep -m1 "iOS 16.4" | grep -oE 'com\.apple\.CoreSimulator\.SimRuntime\.iOS-[0-9-]+' | head -1)
+          echo "runtime: $RT"
+          UDID=$(xcrun simctl create "iPhone 14 test" com.apple.CoreSimulator.SimDeviceType.iPhone-14 "$RT")
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b | tail -n 3
+          xcrun simctl install "$UDID" simbuild/Build/Products/Release-iphonesimulator/ClaudeLegacy.app
+          mkdir -p shots out
+          cd test && nohup python3 -m http.server 8765 --bind 127.0.0.1 > ../server.log 2>&1 &
+          sleep 2
+
+      - name: Run the scenarios
+        run: |
+          B=com.necro144.claudelegacy
+          shoot () { xcrun simctl io "$UDID" screenshot "shots/$1.png"; }
+          launch () {  # name url tab
+            xcrun simctl terminate "$UDID" "$B" || true
+            SIMCTL_CHILD_TEST_URL="$2" SIMCTL_CHILD_TEST_TAB="$3" SIMCTL_CHILD_TEST_WAIT=16 \
+            SIMCTL_CHILD_TEST_JS_FILE="$GITHUB_WORKSPACE/test/noop.js" SIMCTL_CHILD_TEST_JS2_FILE="$GITHUB_WORKSPACE/test/report-site.js" \
+            SIMCTL_CHILD_TEST_OUT="$GITHUB_WORKSPACE/out/$1.txt" xcrun simctl launch "$UDID" "$B"
+          }
+          launch login http://127.0.0.1:8765/login.html 0
+          sleep 5;  shoot 1-login-popup
+          sleep 14; shoot 2-login-done
+          launch blank http://127.0.0.1:8765/blank.html 0
+          sleep 14; shoot 3-blank-panel
+          launch alert http://127.0.0.1:8765/alert.html 0
+          sleep 5;  shoot 4-alert
+          launch site https://claude.ai 0
+          sleep 24; shoot 5-real-site
+          launch settings http://127.0.0.1:8765/blank.html 2
+          sleep 5;  shoot 6-settings
+          for f in login blank alert site; do echo "===== $f"; cat out/$f.txt || echo none; done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: port-results
+          path: |
+            shots
+            out

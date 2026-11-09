@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#111;color:#fff;font:22px -apple-system,sans-serif;padding:40px 24px">
+<h1 id="s">Main page: waiting for login...</h1>
+<p id="log"></p>
+<script>
+// Imitates a sign-in that opens a popup the way Clerk-style logins do:
+// open a blank window, then point it at the login page, then hear back from it.
+window.addEventListener('message', function (e) {
+  document.getElementById('s').textContent = 'LOGIN OK: ' + e.data;
+  document.body.style.background = '#063';
+});
+setTimeout(function () {
+  var p = window.open('', 'login');
+  if (!p) { document.getElementById('s').textContent = 'POPUP BLOCKED'; return; }
+  setTimeout(function () { p.location = '/popup.html'; }, 500);
+}, 1200);
+</script>
