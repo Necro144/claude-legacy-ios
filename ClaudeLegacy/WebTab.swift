@@ -19,6 +19,8 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     @Published var loading = false
     @Published var popup: WKWebView?
     @Published var blankNote: String?
+    @Published var crashed = false
+    private var crashTimes: [Date] = []
     private var bag = Set<AnyCancellable>()
     private var downloadFiles: [ObjectIdentifier: URL] = [:]
     private var probeToken = 0
@@ -126,6 +128,7 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
 
     func home() {
         failed = false
+        crashed = false
         blankNote = nil
         // TEST_URL is only used by the automated simulator test.
         let override = ProcessInfo.processInfo.environment["TEST_URL"].flatMap { URL(string: $0) }
@@ -134,6 +137,7 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
 
     func reload() {
         failed = false
+        crashed = false
         blankNote = nil
         if webView.url == nil { home() } else { webView.reload() }
     }
@@ -180,7 +184,8 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
 
     func copyDetails() {
         let recent = ErrorLog.shared.items.suffix(12).joined(separator: "\n")
-        UIPasteboard.general.string = "Blank page\n\(blankNote ?? "")\n\nRecent messages:\n\(recent)"
+        let title = crashed ? "Page keeps closing\n\(webView.url?.absoluteString ?? "?")" : "Blank page\n\(blankNote ?? "")"
+        UIPasteboard.general.string = "\(title)\n\nRecent messages:\n\(recent)"
     }
 
     // MARK: navigation
@@ -277,9 +282,25 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         if isMain(webView) { done(failure: true) }
     }
 
+    // When a page crashes the same way every time it opens (a reply that crashes the page on this iPhone),
+    // reloading it right away only crashes it again, which made the screen flash black and reload forever.
+    // So reload once, and if it dies again within a minute, stop and let the user choose.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        ErrorLog.shared.add("the page process stopped; reloading")
-        if isMain(webView) { reload() }
+        guard isMain(webView) else { return }
+        let now = Date()
+        crashTimes = crashTimes.filter { now.timeIntervalSince($0) < 60 } + [now]
+        probeToken += 1
+        loading = false
+        blankNote = nil
+        webView.scrollView.refreshControl?.endRefreshing()
+        let address = webView.url?.absoluteString ?? "?"
+        if crashTimes.count >= 2 {
+            ErrorLog.shared.add("the page process stopped again at \(address); not reloading, to avoid a loop")
+            crashed = true
+        } else {
+            ErrorLog.shared.add("the page process stopped at \(address); reloading")
+            reload()
+        }
     }
 
     // MARK: windows opened by the page (sign-in popups)
@@ -432,7 +453,35 @@ struct WebTab: View {
                 .background(Theme.bg)
             }
 
-            if model.blankNote != nil && !model.failed {
+            if model.crashed && !model.failed {
+                VStack(spacing: 14) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 40))
+                        .foregroundColor(Theme.dim)
+                    Text("This page keeps closing")
+                        .font(.headline)
+                    Text("It stopped twice in a row, so it was not reloaded again. Try again, or start a new chat. If it keeps happening, copy the details and send them to Necro.")
+                        .font(.subheadline)
+                        .foregroundColor(Theme.dim)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                    HStack(spacing: 10) {
+                        Button("Try again") { model.reload() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(Theme.accent)
+                        Button("New chat") { model.home() }
+                            .buttonStyle(.bordered)
+                            .tint(.white)
+                    }
+                    Button("Copy details") { model.copyDetails() }
+                        .buttonStyle(.bordered)
+                        .tint(.white)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Theme.bg)
+            }
+
+            if model.blankNote != nil && !model.failed && !model.crashed {
                 VStack {
                     Spacer()
                     VStack(spacing: 10) {
